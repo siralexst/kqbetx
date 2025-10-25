@@ -6,7 +6,8 @@
 
       <h2 class="text-lg font-semibold mb-2 text-cyan-300">📋 Lipește JSON-ul de meci</h2>
       <p class="text-sm text-gray-400 mb-4">
-        Lipește mai jos JSON-ul generat în ChatGPT din pozele cu timeline-ul. Apoi apasă <strong>Trimite în Supabase</strong>.
+        Lipește mai jos <strong>JSON-ul generat în ChatGPT</strong> din pozele cu timeline-ul. <br />
+        Apoi apasă <strong>Trimite în Supabase</strong>.
       </p>
 
       <textarea
@@ -51,7 +52,6 @@ import { createClient } from "@supabase/supabase-js";
 const supabaseUrl = "https://hgvimvswbzvhtuaszwqv.supabase.co";
 const supabaseKey =
   "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImhndmltdnN3Ynp2aHR1YXN6d3F2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjA2Njg5MDcsImV4cCI6MjA3NjI0NDkwN30.vHtdIuMKCU5Su3ZoMbVLlKKSl3Xd0zxr0lmrG1kPiXc";
-
 const supabase = createClient(supabaseUrl, supabaseKey);
 
 // 🌙 State
@@ -71,7 +71,23 @@ async function submitToSupabase() {
     loading.value = true;
     message.value = "";
 
-    const parsed = JSON.parse(jsonInput.value);
+    // 🧹 Normalizează textul JSON din orice sursă (Safari, PWA, Desktop etc.)
+    let cleanedInput = jsonInput.value
+      .replace(/[“”]/g, '"') // smart quotes
+      .replace(/[‘’]/g, "'") // smart apostrophes
+      .replace(/\u200B/g, "") // zero-width space
+      .replace(/\u2028/g, "") // line separator
+      .replace(/\u2029/g, "") // paragraph separator
+      .replace(/\r/g, "")
+      .trim();
+
+    // 🧠 Verificare simplă (lipsește acolada de început?)
+    if (!cleanedInput.startsWith("{") && !cleanedInput.startsWith("[")) {
+      throw new Error("⚠️ Format invalid: lipsește '{' la începutul JSON-ului.");
+    }
+
+    // 🧩 Încearcă parsarea
+    const parsed = JSON.parse(cleanedInput);
 
     // Fallback date dacă e null/gol
     if (!parsed.date || parsed.date.trim?.() === "") {
@@ -119,11 +135,11 @@ async function submitToSupabase() {
     const { error: eventError } = await supabase.from("events").insert(events);
     if (eventError) throw eventError;
 
-    message.value = "✅ Datele au fost salvate în Supabase!";
+    message.value = "✅ Datele au fost salvate cu succes în Supabase!";
     messageColor.value = "text-green-400";
   } catch (err: any) {
     console.error(err);
-    message.value = "❌ Eroare: " + (err.message || "verifică structura JSON");
+    message.value = "❌ Eroare: " + (err.message || "Verifică structura JSON.");
     messageColor.value = "text-red-400";
   } finally {
     loading.value = false;
