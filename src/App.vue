@@ -1,230 +1,132 @@
-<script setup lang="ts">
-import { ref } from "vue";
-import { z } from "zod";
-import { supabase } from "./supabase";
-import type { IngestPayload, IngestEvent } from "./types";
-
-const rawJson = ref("");
-const busy = ref(false);
-const toast = ref<{type:"ok"|"err", msg:string}|null>(null);
-
-// Zod validator (minimal)
-const EventZ = z.object({
-  minute: z.number().int().nonnegative(),
-  period: z.enum(["1H","2H","ET","PEN"]).optional(),
-  team: z.enum(["home","away"]),
-  event_type: z.enum(["goal","penalty","own_goal","yellow","red","sub_in","sub_out","corner","offside"]),
-  player_name: z.string().optional(),
-  player_in: z.string().optional(),
-  player_out: z.string().optional(),
-  assist: z.string().optional(),
-  score_after: z.string().optional(),
-  raw_text: z.string().optional()
-});
-const PayloadZ = z.object({
-  country: z.string().min(2),
-  country_code: z.string().optional(),
-  league: z.string().min(2),
-  season: z.string().min(4),
-  date: z.string().optional(),
-  home_team: z.string().min(1),
-  away_team: z.string().min(1),
-  score_ht: z.string().optional(),
-  score_ft: z.string().optional(),
-  stats: z.object({
-    shots_home: z.number().optional(),
-    shots_away: z.number().optional(),
-    corners_home: z.number().optional(),
-    corners_away: z.number().optional(),
-    possession_home: z.number().optional(),
-    possession_away: z.number().optional()
-  }).optional(),
-  events: z.array(EventZ),
-  features_ht: z.record(z.any()).optional()
-});
-
-function countBy(events: IngestEvent[], team: "home" | "away", type: string) {
-  return events.filter(e => e.team === team && e.event_type === type).length;
-}
-
-async function upsertCountry(name: string, code?: string) {
-  const { data } = await supabase
-    .from("countries").select("id").eq("name", name).maybeSingle();
-  if (data) return data.id;
-
-  const { data: ins, error } = await supabase
-    .from("countries").insert([{ name, code: code ?? name.slice(0,3).toUpperCase() }]).select("id").single();
-  if (error) throw error;
-  return ins.id;
-}
-
-async function upsertLeague(country_id: number, name: string, season: string) {
-  const { data } = await supabase
-    .from("leagues").select("id")
-    .eq("country_id", country_id).eq("name", name).eq("season", season)
-    .maybeSingle();
-  if (data) return data.id;
-
-  const { data: ins, error } = await supabase
-    .from("leagues").insert([{ country_id, name, season }]).select("id").single();
-  if (error) throw error;
-  return ins.id;
-}
-
-async function ingest() {
-  toast.value = null;
-  busy.value = true;
-  try {
-    const parsed = PayloadZ.parse(JSON.parse(rawJson.value)) as IngestPayload;
-
-    // 1) Country & League
-    const countryId = await upsertCountry(parsed.country, parsed.country_code);
-    const leagueId = await upsertLeague(countryId, parsed.league, parsed.season);
-
-    // 2) Derived counts from events (robuste când OCR nu are agregate)
-    const goals_home = countBy(parsed.events, "home", "goal") + countBy(parsed.events, "home", "penalty") + countBy(parsed.events, "home", "own_goal");
-    const goals_away = countBy(parsed.events, "away", "goal") + countBy(parsed.events, "away", "penalty") + countBy(parsed.events, "away", "own_goal");
-    const yellow_home = countBy(parsed.events, "home", "yellow");
-    const yellow_away = countBy(parsed.events, "away", "yellow");
-    const red_home = countBy(parsed.events, "home", "red");
-    const red_away = countBy(parsed.events, "away", "red");
-
-    // 3) Insert match
-    const matchRow: any = {
-      league_id: leagueId,
-      date: parsed.date ?? null,
-      country: parsed.country,
-      league: parsed.league,
-      home_team: parsed.home_team,
-      away_team: parsed.away_team,
-      score_ht: parsed.score_ht ?? null,
-      score_ft: parsed.score_ft ?? null,
-      goals_home, goals_away,
-      yellow_home, yellow_away,
-      red_home, red_away,
-      shots_home: parsed.stats?.shots_home ?? 0,
-      shots_away: parsed.stats?.shots_away ?? 0,
-      corners_home: parsed.stats?.corners_home ?? 0,
-      corners_away: parsed.stats?.corners_away ?? 0,
-      possession_home: parsed.stats?.possession_home ?? null,
-      possession_away: parsed.stats?.possession_away ?? null,
-      events_json: parsed.events
-    };
-
-    const { data: matchIns, error: matchErr } = await supabase
-      .from("matches").insert([matchRow]).select("id").single();
-    if (matchErr) throw matchErr;
-    const match_id = matchIns.id as number;
-
-    // 4) Insert events (batch)
-    if (parsed.events?.length) {
-      const eventsPayload = parsed.events.map(e => ({
-        match_id,
-        minute: e.minute,
-        period: e.period ?? (e.minute <= 45 ? "1H" : "2H"),
-        team: e.team,
-        event_type: e.event_type,
-        player_name: e.player_name ?? null,
-        player_in: e.player_in ?? null,
-        player_out: e.player_out ?? null,
-        assist: e.assist ?? null,
-        score_after: e.score_after ?? null,
-        raw_text: e.raw_text ?? null
-      }));
-      const { error: evErr } = await supabase.from("events").insert(eventsPayload);
-      if (evErr) throw evErr;
-    }
-
-    // 5) Optional features_ht
-    if (parsed.features_ht && Object.keys(parsed.features_ht).length) {
-      const { error: fErr } = await supabase
-        .from("features_ht").insert([{ match_id, ...parsed.features_ht }]);
-      if (fErr) throw fErr;
-    }
-
-    toast.value = { type: "ok", msg: "Date salvate în Supabase. GG! 🎉" };
-    rawJson.value = "";
-  } catch (e: any) {
-    console.error(e);
-    toast.value = { type: "err", msg: e?.message ?? "Eroare necunoscută." };
-  } finally {
-    busy.value = false;
-  }
-}
-</script>
-
 <template>
-  <main class="min-h-screen pb-20 md:pb-0">
-    <!-- Header -->
-    <header class="sticky top-0 z-20 backdrop-blur-md bg-black/30 border-b border-white/10">
-      <div class="mx-auto max-w-xl px-4 py-4 flex items-center justify-between">
-        <div class="flex items-center gap-3">
-          <div class="h-9 w-9 rounded-2xl bg-primary/20 border border-primary/40 flex items-center justify-center shadow-neon">⚡</div>
-          <div>
-            <h1 class="text-xl font-semibold tracking-wide">QBetX</h1>
-            <p class="text-xs text-white/60 -mt-1">Upload & Save JSON</p>
-          </div>
-        </div>
-        <span class="text-primary/90 text-sm">PWA</span>
-      </div>
-    </header>
+  <main class="min-h-screen flex flex-col items-center justify-start p-6 text-white bg-gradient-to-b from-[#030712] to-[#0a0f1f]">
+    <div class="w-full max-w-lg bg-[#0e1629]/70 backdrop-blur-xl rounded-3xl shadow-[0_0_30px_rgba(0,255,255,0.15)] p-6 mt-10 border border-cyan-500/20">
+      <h1 class="text-3xl font-bold text-cyan-400 text-center mb-2">QBetX</h1>
+      <p class="text-center text-gray-400 mb-6">Upload & Save JSON</p>
 
-    <!-- Content -->
-    <section class="mx-auto max-w-xl px-4 pt-6 space-y-6">
-      <!-- Card -->
-      <div class="card">
-        <h2 class="text-lg font-medium mb-3">📤 Lipește JSON-ul de meci</h2>
-        <p class="text-white/70 text-sm mb-4">
-          Lipește mai jos JSON-ul generat în ChatGPT din pozele cu timeline-ul. Apoi apasă <b>Trimite în Supabase</b>.
-        </p>
-        <textarea class="input min-h-[260px] font-mono text-sm" v-model="rawJson" placeholder='{
-  "country": "England",
-  "league": "Premier League",
-  "season": "2024-2025",
-  "date": "2025-05-18",
-  "home_team": "Nottingham Forest",
-  "away_team": "Chelsea",
-  "score_ht": "0-0",
-  "score_ft": "0-3",
-  "events": [
-    { "minute": 49, "team": "away", "event_type": "goal", "player_name": "Josh Acheampong", "assist": "Pedro Neto", "score_after": "0-1" },
-    { "minute": 52, "team": "away", "event_type": "goal", "player_name": "Pedro Neto", "assist": "Reece James", "score_after": "0-2" },
-    { "minute": 80, "team": "home", "event_type": "yellow", "player_name": "Ibrahim Sangaré" },
-    { "minute": 90, "team": "away", "event_type": "goal", "player_name": "Reece James", "score_after": "0-3" }
-  ]
-}'></textarea>
+      <h2 class="text-lg font-semibold mb-2 text-cyan-300">📋 Lipește JSON-ul de meci</h2>
+      <p class="text-sm text-gray-400 mb-4">
+        Lipește mai jos JSON-ul generat în ChatGPT din pozele cu timeline-ul. Apoi apasă <strong>Trimite în Supabase</strong>.
+      </p>
 
-        <div class="mt-4 flex gap-3">
-          <button class="btn" :disabled="busy" @click="ingest">
-            <span v-if="!busy">Trimite în Supabase</span>
-            <span v-else>Se salvează…</span>
-          </button>
-          <button class="btn border-white/20" :disabled="busy" @click="rawJson = ''">Curăță</button>
-        </div>
+      <textarea
+        v-model="jsonInput"
+        placeholder='{"country":"", "league":"", ... }'
+        class="w-full h-64 p-3 rounded-xl bg-[#111a2f] text-white text-sm font-mono border border-cyan-500/30 focus:border-cyan-400 focus:outline-none resize-none"
+      ></textarea>
+
+      <div class="flex justify-center gap-4 mt-6">
+        <button
+          @click="submitToSupabase"
+          :disabled="loading"
+          class="px-6 py-2 rounded-full bg-cyan-500 hover:bg-cyan-400 text-black font-semibold shadow-[0_0_15px_rgba(0,255,255,0.5)] transition disabled:opacity-50"
+        >
+          {{ loading ? "Se trimite..." : "Trimite în Supabase" }}
+        </button>
+        <button
+          @click="clearInput"
+          class="px-6 py-2 rounded-full bg-gray-700 hover:bg-gray-600 text-white font-semibold transition"
+        >
+          Curăță
+        </button>
       </div>
 
-      <!-- Roadmap / Disabled tabs preview -->
-      <div class="grid grid-cols-2 gap-4">
-        <div class="card opacity-70">
-          <div class="text-white/70 text-sm">📊 Stats & Patterns (curând)</div>
-        </div>
-        <div class="card opacity-70">
-          <div class="text-white/70 text-sm">🧠 Predictii ML (curând)</div>
-        </div>
-      </div>
-    </section>
+      <p v-if="message" class="text-center mt-4" :class="messageColor">
+        {{ message }}
+      </p>
+    </div>
 
-    <!-- Toast -->
-    <transition name="fade">
-      <div v-if="toast" class="fixed bottom-5 inset-x-0 mx-auto max-w-xs glass rounded-2xl px-4 py-3 border"
-           :class="toast.type==='ok' ? 'border-emerald-400/50 shadow-neon' : 'border-rose-400/50 shadow-neon'">
-        <p class="text-center text-sm">{{ toast.msg }}</p>
-      </div>
-    </transition>
+    <div class="flex justify-center gap-4 mt-10">
+      <button class="px-6 py-2 rounded-xl bg-[#1a2238] text-gray-400 shadow-inner">📊 Stats & Patterns (curând)</button>
+      <button class="px-6 py-2 rounded-xl bg-[#1a2238] text-gray-400 shadow-inner">🧠 Predictii ML (curând)</button>
+    </div>
   </main>
 </template>
 
-<style scoped>
-.fade-enter-active,.fade-leave-active { transition: opacity .25s }
-.fade-enter-from,.fade-leave-to { opacity: 0 }
-</style>
+<script setup lang="ts">
+import { ref } from "vue";
+import { createClient } from "@supabase/supabase-js";
+
+// 🔗 Conectare directă la Supabase
+const supabaseUrl = "https://hgvimvswbzvhtuaszwqv.supabase.co";
+const supabaseKey =
+  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImhndmltdnN3Ynp2aHR1YXN6d3F2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjA2Njg5MDcsImV4cCI6MjA3NjI0NDkwN30.vHtdIuMKCU5Su3ZoMbVLlKKSl3Xd0zxr0lmrG1kPiXc";
+
+const supabase = createClient(supabaseUrl, supabaseKey);
+
+// 🌙 State
+const jsonInput = ref("");
+const message = ref("");
+const messageColor = ref("");
+const loading = ref(false);
+
+function clearInput() {
+  jsonInput.value = "";
+  message.value = "";
+}
+
+// 🚀 Trimite JSON în Supabase
+async function submitToSupabase() {
+  try {
+    loading.value = true;
+    message.value = "";
+
+    const parsed = JSON.parse(jsonInput.value);
+
+    // Fallback date dacă e null/gol
+    if (!parsed.date || parsed.date.trim?.() === "") {
+      const today = new Date().toISOString().slice(0, 10);
+      parsed.date = today;
+    }
+
+    // Validare minimală (match + events)
+    if (!parsed.country || !parsed.league || !parsed.home_team || !parsed.away_team) {
+      throw new Error("Câmpuri lipsă: country, league, home_team, away_team.");
+    }
+    if (!Array.isArray(parsed.events) || parsed.events.length === 0) {
+      throw new Error("Lista de evenimente este goală.");
+    }
+
+    // 🔹 Inserare în matches
+    const { data: matchData, error: matchError } = await supabase
+      .from("matches")
+      .insert([
+        {
+          country: parsed.country,
+          league: parsed.league,
+          season: parsed.season,
+          date: parsed.date,
+          home_team: parsed.home_team,
+          away_team: parsed.away_team,
+          score_ht: parsed.score_ht,
+          score_ft: parsed.score_ft,
+        },
+      ])
+      .select("id")
+      .single();
+
+    if (matchError) throw matchError;
+
+    // 🔹 Inserare în events
+    const events = parsed.events.map((e: any) => ({
+      match_id: matchData.id,
+      minute: e.minute,
+      period: e.period,
+      team: e.team,
+      event_type: e.event_type,
+    }));
+
+    const { error: eventError } = await supabase.from("events").insert(events);
+    if (eventError) throw eventError;
+
+    message.value = "✅ Datele au fost salvate în Supabase!";
+    messageColor.value = "text-green-400";
+  } catch (err: any) {
+    console.error(err);
+    message.value = "❌ Eroare: " + (err.message || "verifică structura JSON");
+    messageColor.value = "text-red-400";
+  } finally {
+    loading.value = false;
+  }
+}
+</script>
