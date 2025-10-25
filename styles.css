@@ -1,0 +1,16 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root { --grad: radial-gradient(1200px 800px at 70% -10%, rgba(0,240,255,.18), transparent 60%), radial-gradient(900px 600px at 0% 100%, rgba(0,140,255,.18), transparent 55%); }
+body { background-image: var(--grad); background-attachment: fixed; }
+.glass { background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.08); backdrop-filter: blur(8px); }
+.btn {
+  @apply px-4 py-3 rounded-2xl font-medium border border-cyan-400/30 hover:border-cyan-300/60 transition shadow-neon;
+}
+.card {
+  @apply glass rounded-3xl p-4 md:p-6 shadow-neon;
+}
+.input {
+  @apply w-full bg-black/30 border border-white/10 rounded-2xl p-4 outline-none focus:border-primary transition;
+}
